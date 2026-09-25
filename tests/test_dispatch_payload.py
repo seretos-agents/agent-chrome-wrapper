@@ -1,5 +1,6 @@
 """Tests for ticket #34: a `changelog` field in the `plugin-release`
-`repository_dispatch` payload this repo POSTs to `Seretos/agent-marketplace`.
+`repository_dispatch` payload this repo POSTs to the two seretos-agents
+marketplaces (modular-software-factory-staging, then modular-software-factory).
 
 Two complementary layers, mirroring `tests/test_release_workflow.py`'s
 established YAML-parsing pattern (`_load_workflow`/`_find_step`), extended
@@ -49,7 +50,8 @@ TAG_EXPRESSION = {
     DISPATCH_YML: "steps.tag.outputs.tag",
 }
 
-CURL_URL = "https://api.github.com/repos/Seretos/agent-marketplace/dispatches"
+STAGING_CURL_URL = "https://api.github.com/repos/seretos-agents/modular-software-factory-staging/dispatches"
+CURATED_CURL_URL = "https://api.github.com/repos/seretos-agents/modular-software-factory/dispatches"
 CURL_FLAGS = "curl -fsSL -X POST"
 AUTH_HEADER = '-H "Authorization: Bearer $GH_PAT"'
 ACCEPT_HEADER = '-H "Accept: application/vnd.github+json"'
@@ -64,7 +66,7 @@ DEFAULT_ENV = {
     "DESC": "A Chrome wrapper MCP server.",
     "VERSION": "0.0.1",
     "TAG": "agent-chrome-wrapper--v0.0.1",
-    "REPO": "Seretos/agent-chrome-wrapper",
+    "REPO": "seretos-agents/agent-chrome-wrapper",
 }
 
 TRUNCATE_LIMIT = 30000
@@ -1212,23 +1214,25 @@ def test_curl_reads_the_file_the_builder_writes(workflow, monkeypatch, tmp_path)
     assert payload_file.exists(), "expected PAYLOAD_FILE to exist after the builder ran"
     json.loads(payload_file.read_text(encoding="utf-8"))  # must parse as JSON
 
-    # (3) text layer: curl reads exactly that file, and no other -d.
+    # (3) text layer: curl reads exactly that file, twice -- once per
+    # marketplace dispatch (staging, then curated), no other -d.
     run_text = _dispatch_step(workflow).get("run", "")
     assert '-d @"$PAYLOAD_FILE"' in run_text
     dash_d_occurrences = run_text.count(" -d ")
-    assert dash_d_occurrences == 1, (
-        f"expected exactly one `-d` argument in the curl invocation, found "
-        f"{dash_d_occurrences}"
+    assert dash_d_occurrences == 2, (
+        f"expected exactly two `-d` arguments in the curl invocations (one "
+        f"per marketplace dispatch), found {dash_d_occurrences}"
     )
 
 
 @pytest.mark.parametrize("workflow", BOTH_WORKFLOWS, ids=WORKFLOW_IDS)
 def test_curl_target_and_headers_unchanged(workflow):
     run_text = _dispatch_step(workflow).get("run", "")
-    assert CURL_URL in run_text
-    assert CURL_FLAGS in run_text
-    assert AUTH_HEADER in run_text
-    assert ACCEPT_HEADER in run_text
+    assert STAGING_CURL_URL in run_text
+    assert CURATED_CURL_URL in run_text
+    assert run_text.count(CURL_FLAGS) == 2
+    assert run_text.count(AUTH_HEADER) == 2
+    assert run_text.count(ACCEPT_HEADER) == 2
 
 
 @pytest.mark.parametrize("workflow", BOTH_WORKFLOWS, ids=WORKFLOW_IDS)
