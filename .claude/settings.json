@@ -3,7 +3,8 @@
     "agent-project-issues@modular-software-factory": true,
     "agent-worktree@modular-software-factory": true,
     "agent-autonomous-developer@modular-software-factory": true,
-    "agent-ticket-orchestrator@modular-software-factory": true
+    "agent-ticket-orchestrator@modular-software-factory": true,
+    "agent-autonomous-prompt-engineer@modular-software-factory": true
   },
   "extraKnownMarketplaces": {
     "modular-software-factory": {
