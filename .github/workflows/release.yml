@@ -41,32 +41,25 @@ jobs:
       plugin_name: ${{ steps.meta.outputs.plugin_name }}
       tag:         ${{ steps.meta.outputs.tag }}
       description:  ${{ steps.meta.outputs.description }}
+      main_sha:    ${{ steps.preflight.outputs.main_sha }}
+      prev_tag:    ${{ steps.preflight.outputs.prev_tag }}
     steps:
-      - name: Validate version is semver
-        shell: bash
-        run: |
-          V="${{ inputs.version }}"
-          if [[ ! "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::Version '$V' is not valid semver (expected MAJOR.MINOR.PATCH[-PRERELEASE])."
-            exit 1
-          fi
-
+      # required by release-preflight.sh (fetch-depth: 0): the pre-flight
+      # cross-checks origin's `<plugin>--v*`/`src/*` tags against this
+      # checkout's own local tags, so a shallow checkout must never be
+      # mistaken for "no tags exist yet, this is a first release".
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Fail if tag already exists
+      - name: Release pre-flight
+        id: preflight
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          PLUGIN_NAME=$(jq -r '.name' .claude-plugin/plugin.json)
-          TAG="${PLUGIN_NAME}--v${{ inputs.version }}"
-          if gh api "repos/${{ github.repository }}/git/refs/tags/${TAG}" >/dev/null 2>&1; then
-            echo "::error::Tag ${TAG} already exists. Delete it first or pick a new version."
-            exit 1
-          fi
+          bash .github/scripts/release-preflight.sh "$(jq -r .name .claude-plugin/plugin.json)" "${{ inputs.version }}"
 
       - name: Stamp version into pyproject.toml + plugin manifests
         shell: bash
@@ -260,6 +253,39 @@ jobs:
           echo "stage=$STAGE" >> "$GITHUB_OUTPUT"
           echo "asset=$ZIP"   >> "$GITHUB_OUTPUT"
 
+      # The orphan `release` branch has no history, so `gh release create
+      # --generate-notes`/`--notes-start-tag` (both of which walk commit
+      # history on the branch/tag they're pointed at) find nothing there --
+      # this is the ticket's own symptom. Notes are generated here instead,
+      # against `main`'s real history, between two lightweight `src/<TAG>`
+      # markers (see AGENTS.md), and handed to "Create tag and GitHub
+      # Release" below as a file.
+      - name: Generate release notes from main
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.stamp.outputs.tag }}"
+          MAIN_SHA="${{ needs.stamp.outputs.main_sha }}"
+          PREV_TAG="${{ needs.stamp.outputs.prev_tag }}"
+          ARGS=(-X POST "repos/${{ github.repository }}/releases/generate-notes" -f "tag_name=src/${TAG}" -f "target_commitish=${MAIN_SHA}")
+          if [ -n "$PREV_TAG" ]; then
+            ARGS+=(-f "previous_tag_name=src/${PREV_TAG}")
+          fi
+          gh api "${ARGS[@]}" --jq .body > "$RUNNER_TEMP/notes.md"
+
+      # Pushed unconditionally (release-preflight.sh already refused to run
+      # if src/<TAG> existed), after the build succeeded and before the
+      # orphan push -- so a build failure never leaves a marker behind, and
+      # the marker exists before the orphan branch/tag that depend on it.
+      - name: Push source marker
+        shell: bash
+        run: |
+          TAG="${{ needs.stamp.outputs.tag }}"
+          MAIN_SHA="${{ needs.stamp.outputs.main_sha }}"
+          git tag "src/${TAG}" "$MAIN_SHA"
+          git push origin "refs/tags/src/${TAG}"
+
       - name: Push orphan release branch and capture commit
         id: rel
         shell: bash
@@ -268,8 +294,11 @@ jobs:
           ZIP="${{ steps.stage.outputs.asset }}"
 
           # Stash staging + zip outside the worktree before `checkout --orphan`
-          # wipes everything.
+          # wipes everything. The release scripts are needed again below
+          # (Dispatch to agent-marketplace) after `git clean -fdx` has wiped
+          # .github/scripts from this checkout, so copy them out too.
           TMP=$(mktemp -d)
+          cp -a .github/scripts "$RUNNER_TEMP/release-scripts"
                     # .gitattributes MUST ship on the orphan release branch: Claude Code clones it,
           # and on a Windows machine with core.autocrlf=true (Git-for-Windows default)
           # a checkout without `* text=auto eol=lf` writes CRLF into the plugin cache —
@@ -318,6 +347,11 @@ jobs:
           SHA=$(git rev-parse HEAD)
           echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
 
+      # `--generate-notes`/`--notes-start-tag` both walk commit history on
+      # the tag/branch they're pointed at; the orphan `release` branch this
+      # tag targets has none. `--notes-file` instead ships the notes already
+      # generated on `main`'s real history by "Generate release notes from
+      # main" above.
       - name: Create tag and GitHub Release
         shell: bash
         env:
@@ -328,7 +362,7 @@ jobs:
             --repo "${{ github.repository }}" \
             --target "${{ steps.rel.outputs.sha }}" \
             --title "$TAG" \
-            --generate-notes \
+            --notes-file "$RUNNER_TEMP/notes.md" \
             ${{ contains(inputs.version, '-') && '--prerelease' || '' }} \
             "${{ steps.rel.outputs.asset }}"
 
@@ -339,7 +373,7 @@ jobs:
           TAG:            ${{ needs.stamp.outputs.tag }}
           CHANGELOG_FILE: ${{ runner.temp }}/changelog.md
         run: |
-          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body -q '.body // empty' > "$CHANGELOG_FILE" 2>/dev/null || true
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body -q '.body // empty' > "$CHANGELOG_FILE" || echo "::warning::gh release view failed for $TAG; changelog will be omitted"
 
       # Tags created via GITHUB_TOKEN don't fire downstream push:tags workflows
       # (Actions blocks this to prevent recursive loops). Call the marketplace
@@ -358,47 +392,9 @@ jobs:
         run: |
           # DESC comes from the stamp job's output (env above); the stamped/
           # tree it used to be read from no longer exists at this point —
-          # `git clean -fdx` in the release-branch step removed it.
-          python3 - <<'PY'
-          import json, os
-
-          changelog_file = os.environ["CHANGELOG_FILE"]
-          body = ""
-          if os.path.exists(changelog_file):
-              with open(changelog_file, "r", encoding="utf-8", newline="") as fh:
-                  body = fh.read()
-
-          TRUNCATE_LIMIT = 30000
-          repo = os.environ["REPO"]
-          tag = os.environ["TAG"]
-
-          client_payload = {
-              "name": os.environ["NAME"],
-              "description": os.environ["DESC"],
-              "repo": repo,
-              "category": "mcp",
-              "version": os.environ["VERSION"],
-              "ref": tag,
-              "icon": f"https://raw.githubusercontent.com/{repo}/{tag}/assets/icon.png",
-              "description_url": f"https://raw.githubusercontent.com/{repo}/{tag}/description.md",
-          }
-
-          if body.strip():
-              encoded = body.encode("utf-8")
-              if len(encoded) > TRUNCATE_LIMIT:
-                  truncated = encoded[:TRUNCATE_LIMIT].decode("utf-8", "ignore")
-                  body = truncated + f"\n\n_… truncated. Full release notes: https://github.com/{repo}/releases/tag/{tag}_"
-              client_payload["changelog"] = body
-          else:
-              print(f"::warning::No release body found for {tag}; dispatching without a changelog.")
-
-          with open(os.environ["PAYLOAD_FILE"], "w", encoding="utf-8") as fh:
-              json.dump(
-                  {"event_type": "plugin-release", "client_payload": client_payload},
-                  fh,
-                  ensure_ascii=False,
-              )
-          PY
+          # `git clean -fdx` in the release-branch step removed it. The
+          # release scripts were copied to $RUNNER_TEMP before that clean.
+          bash "$RUNNER_TEMP/release-scripts/marketplace-payload.sh"
           # Staging first (lands straight to main, no review), then the
           # curated marketplace (opens a review PR) -- same payload file,
           # two independent dispatches.
