@@ -36,6 +36,17 @@ jobs:
         with:
           ref: release
 
+      # marketplace-payload.sh lives on `main`, never on the orphan `release`
+      # branch (which carries only install-ready files, no `.github/`) --
+      # sparse-checked-out into a side directory so it doesn't collide with
+      # the `release` branch checkout above.
+      - name: Checkout release scripts
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: .main-scripts
+          sparse-checkout: .github/scripts
+
       - name: Verify plugin.json version matches tag
         shell: bash
         run: |
@@ -63,7 +74,7 @@ jobs:
           TAG:            ${{ steps.tag.outputs.tag }}
           CHANGELOG_FILE: ${{ runner.temp }}/changelog.md
         run: |
-          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body -q '.body // empty' > "$CHANGELOG_FILE" 2>/dev/null || true
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body -q '.body // empty' > "$CHANGELOG_FILE" || echo "::warning::gh release view failed for $TAG; changelog will be omitted"
 
       - name: Dispatch to agent-marketplace
         env:
@@ -77,46 +88,7 @@ jobs:
           PAYLOAD_FILE:   ${{ runner.temp }}/payload.json
         shell: bash
         run: |
-          python3 - <<'PY'
-          import json, os
-
-          changelog_file = os.environ["CHANGELOG_FILE"]
-          body = ""
-          if os.path.exists(changelog_file):
-              with open(changelog_file, "r", encoding="utf-8", newline="") as fh:
-                  body = fh.read()
-
-          TRUNCATE_LIMIT = 30000
-          repo = os.environ["REPO"]
-          tag = os.environ["TAG"]
-
-          client_payload = {
-              "name": os.environ["NAME"],
-              "description": os.environ["DESC"],
-              "repo": repo,
-              "category": "mcp",
-              "version": os.environ["VERSION"],
-              "ref": tag,
-              "icon": f"https://raw.githubusercontent.com/{repo}/{tag}/assets/icon.png",
-              "description_url": f"https://raw.githubusercontent.com/{repo}/{tag}/description.md",
-          }
-
-          if body.strip():
-              encoded = body.encode("utf-8")
-              if len(encoded) > TRUNCATE_LIMIT:
-                  truncated = encoded[:TRUNCATE_LIMIT].decode("utf-8", "ignore")
-                  body = truncated + f"\n\n_… truncated. Full release notes: https://github.com/{repo}/releases/tag/{tag}_"
-              client_payload["changelog"] = body
-          else:
-              print(f"::warning::No release body found for {tag}; dispatching without a changelog.")
-
-          with open(os.environ["PAYLOAD_FILE"], "w", encoding="utf-8") as fh:
-              json.dump(
-                  {"event_type": "plugin-release", "client_payload": client_payload},
-                  fh,
-                  ensure_ascii=False,
-              )
-          PY
+          bash .main-scripts/.github/scripts/marketplace-payload.sh
           # Staging first (lands straight to main, no review), then the
           # curated marketplace (opens a review PR) -- same payload file,
           # two independent dispatches.

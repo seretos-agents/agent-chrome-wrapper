@@ -120,6 +120,12 @@ def _origin_and_clone(tmp_path, plugin, plugin_versions, src_tag_versions=()):
     `fetch-depth: 0`). Returns (origin_path, clone_path)."""
     origin = tmp_path / "origin.git"
     _git("init", "--bare", str(origin), cwd=tmp_path)
+    # A bare repo's own HEAD symref does not follow whatever branch a later
+    # push happens to create -- it stays on git's configured default (e.g.
+    # "master") regardless. Point it at "main" explicitly so a `git clone`
+    # of this origin checks out a real branch with a resolvable HEAD instead
+    # of an unborn one ("remote HEAD refers to nonexistent ref").
+    _git("symbolic-ref", "HEAD", "refs/heads/main", cwd=origin)
 
     seed = tmp_path / "seed"
     seed.mkdir()
@@ -204,16 +210,24 @@ def test_prev_tag_excludes_the_tag_being_created(run_bash, tmp_path):
 
 
 def test_prev_tag_ignores_foreign_and_malformed_tags(run_bash, tmp_path):
+    # The new version (20.0.0) is deliberately higher than every foreign/
+    # malformed tag below (9.9.9, 5.0.0, leniently-parsed 01.0.0 == 1.0.0),
+    # so each of them WOULD be a valid, higher-than-0.0.1 "strictly lower"
+    # candidate if the namespace filter or leading-zero validation were
+    # missing -- unlike the original 1.0.0 target, under which they were all
+    # excluded by version-ordering alone and the filters were never actually
+    # exercised (test-critic tautology::F2).
     repo = _local_repo_with_version_tags(tmp_path, PLUGIN, ["0.0.1"])
     _git("tag", f"src/{PLUGIN}--v9.9.9", cwd=repo)
     _git("tag", "other-plugin--v5.0.0", cwd=repo)
     _git("tag", f"{PLUGIN}--v01.0.0", cwd=repo)
     _git("tag", f"{PLUGIN}--vbad", cwd=repo)
-    result = run_bash([PREV_RELEASE_TAG_SCRIPT.as_posix(), PLUGIN, "1.0.0"], cwd=repo)
+    result = run_bash([PREV_RELEASE_TAG_SCRIPT.as_posix(), PLUGIN, "20.0.0"], cwd=repo)
     assert result.returncode == 0, f"stderr: {result.stderr!r}"
     assert result.stdout.strip() == f"{PLUGIN}--v0.0.1", (
         "expected src/*, a foreign plugin's tag, and malformed versions "
-        f"(leading zero, non-semver) to be ignored, got {result.stdout!r}"
+        "(leading zero, non-semver) to be ignored even though each is "
+        f"individually 'strictly lower' than 20.0.0, got {result.stdout!r}"
     )
 
 
@@ -283,9 +297,17 @@ def test_preflight_succeeds_when_prev_marker_present(run_bash, tmp_path):
     assert result.returncode == 0, (
         f"stdout: {result.stdout!r} stderr: {result.stderr!r}"
     )
+    # The value written for main_sha must actually be the clone's real HEAD
+    # -- assemble places the src/<TAG> marker there, so a script that writes
+    # `main_sha=` with an empty or wrong value must fail this (test-critic
+    # tautology::F3: the original assertion only checked the key's presence).
+    expected_sha = _git("rev-parse", "HEAD", cwd=clone).stdout.strip()
     output_text = github_output.read_text(encoding="utf-8") if github_output.exists() else ""
     assert f"prev_tag={PLUGIN}--v0.0.7" in output_text, output_text
-    assert "main_sha=" in output_text, output_text
+    assert f"main_sha={expected_sha}" in output_text, (
+        f"expected main_sha to equal the clone's real HEAD {expected_sha!r}, "
+        f"got: {output_text!r}"
+    )
 
 
 def test_preflight_first_release_has_empty_prev_tag(run_bash, tmp_path):
@@ -306,8 +328,13 @@ def test_preflight_first_release_has_empty_prev_tag(run_bash, tmp_path):
 
 
 def test_preflight_rejects_existing_src_marker_for_new_tag(run_bash, tmp_path):
+    # src/<PREV_TAG> (0.0.7) is ALSO seeded here, alongside the offending
+    # src/<TAG> (0.0.8) -- without it, step 5 (missing predecessor marker)
+    # would independently fail this run regardless of whether step 3's
+    # existing-src/<TAG> check does anything at all, so rc==1 would never
+    # isolate that check (test-critic tautology::F1).
     origin, clone = _origin_and_clone(
-        tmp_path, PLUGIN, ["0.0.7"], src_tag_versions=["0.0.8"]
+        tmp_path, PLUGIN, ["0.0.7"], src_tag_versions=["0.0.7", "0.0.8"]
     )
     remote_before = _ls_remote_tags(tmp_path, origin)
     result = run_bash(
@@ -318,9 +345,19 @@ def test_preflight_rejects_existing_src_marker_for_new_tag(run_bash, tmp_path):
     assert result.returncode == 1, (
         f"stdout: {result.stdout!r} stderr: {result.stderr!r}"
     )
+    # The failure must be attributable to the existing src/<TAG> specifically
+    # (not e.g. a missing predecessor marker, which is now seeded and would
+    # otherwise pass) -- the plan's exact phrasing for this case is "use a
+    # new version" (test-critic tautology::F5: the prior membership recheck
+    # below was implied by remote_after == remote_before and asserted
+    # nothing new).
+    combined = result.stdout + result.stderr
+    assert "use a new version" in combined.lower(), (
+        f"expected an error naming the existing src/<TAG> and telling the "
+        f"operator to use a new version, got: {combined!r}"
+    )
     remote_after = _ls_remote_tags(tmp_path, origin)
     assert remote_after == remote_before, "an existing src/<TAG> must never be deleted or moved"
-    assert f"refs/tags/src/{PLUGIN}--v0.0.8" in remote_after
 
 
 def test_preflight_rejects_existing_release_tag(run_bash, tmp_path):
@@ -456,7 +493,6 @@ def test_payload_hostile_changelog_round_trips(run_bash, tmp_path):
     assert body["event_type"] == "plugin-release"
     client_payload = body["client_payload"]
     assert set(client_payload) == FROZEN_KEYS_WITHOUT_CHANGELOG | {"changelog"}
-    assert len(client_payload) == 9
     assert client_payload["changelog"] == HOSTILE_CHANGELOG, (
         "the trailing one newline gh's --jq output appends must be stripped, "
         "and nothing else touched"
@@ -751,6 +787,16 @@ def test_fetch_to_payload_omits_key_when_gh_fails(workflow, run_bash, tmp_path):
     }
     fetch_result = run_bash(["-c", _fetch_step_run_text(workflow)], cwd=tmp_path, env=fetch_env)
     assert fetch_result.returncode == 0, "a failing `gh` must not fail the fetch step"
+    # The fetch step's new runtime behaviour (swapping the old silent
+    # `2>/dev/null || true` for a visible warning) must actually fire here --
+    # asserting only rc 0 and key omission was also satisfied by the OLD
+    # silent-swallow fetch step, so it never exercised this change
+    # (test-critic tautology::F4).
+    fetch_combined = fetch_result.stdout + fetch_result.stderr
+    assert "::warning::gh release view failed" in fetch_combined, (
+        f"expected the fetch step to print a visible ::warning:: on a "
+        f"failing `gh`, got: {fetch_combined!r}"
+    )
 
     payload_file = tmp_path / "payload.json"
     payload_env = {
