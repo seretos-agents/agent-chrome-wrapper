@@ -381,7 +381,7 @@ jobs:
       - name: Dispatch to agent-marketplace
         shell: bash
         env:
-          GH_PAT:         ${{ secrets.MARKETPLACE_DISPATCH_TOKEN }}
+          GH_PAT:         ${{ secrets.ECOSYSTEM_TOKEN }}
           VERSION:        ${{ inputs.version }}
           NAME:           ${{ needs.stamp.outputs.plugin_name }}
           TAG:            ${{ needs.stamp.outputs.tag }}
